@@ -12,6 +12,8 @@ Trabajo de investigación, Par 04: **Tema 2** (Colas de mensajes y procesamiento
 | Paluch Ruberto, Julián | 27229 |
 | Sonza, Matías Javier | 26573 |
 
+> **Documento de investigación:** [`documento-investigacion.pdf`](documento-investigacion.pdf).
+
 > **Motor de base de datos:** el módulo M2 del TPI usa MongoDB, pero esta demo es un proyecto independiente y usa **PostgreSQL**. El patrón Transactional Outbox nació en bases relacionales y ahí la transacción con `BEGIN` y `COMMIT` sobre dos tablas se ve de forma directa. El documento de investigación explica qué cambia en MongoDB.
 
 ---
@@ -199,6 +201,7 @@ Las mismas pruebas corren en GitHub Actions en cada push (`.github/workflows/ci.
 ## Estructura
 
 ```
+documento-investigacion.pdf   Documento de investigación
 app/
   api.py          API: POST /viajes (con outbox), POST /viajes/sin-outbox, GET /viajes/{id}, GET /outbox
   viajes.py       Transacción que guarda viaje + evento
