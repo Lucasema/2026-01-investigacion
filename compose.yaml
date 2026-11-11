@@ -1,0 +1,103 @@
+# Demo: colas de mensajes + Transactional Outbox
+#
+#   docker compose up -d --build             -> levanta todo
+#   docker compose logs -f relay worker       -> sigue lo que pasa
+#   docker compose --profile test run --rm tests   -> corre las pruebas
+#
+# Las credenciales son de desarrollo; se pueden cambiar con un archivo .env (ver .env.example).
+
+x-app: &app
+  build: .
+  image: demo-colas-outbox:1.0.0
+  environment: &app-env
+    DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/${POSTGRES_DB:-demo}
+    RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-demo}:${RABBITMQ_DEFAULT_PASS:-demo}@rabbitmq:5672/%2F
+    RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-demo}
+    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-demo}
+    TIEMPO_PROCESAMIENTO: ${TIEMPO_PROCESAMIENTO:-3}
+    INTERVALO_RELAY: ${INTERVALO_RELAY:-1}
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-demo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo}
+      POSTGRES_DB: ${POSTGRES_DB:-demo}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    # Nombre fijo: RabbitMQ guarda sus datos por nombre de nodo; así las colas durables
+    # y los mensajes persistentes sobreviven a "docker compose restart rabbitmq".
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-demo}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-demo}
+      # La consola web actualiza sus estadísticas cada 1 s (por defecto, cada 5 s)
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit collect_statistics_interval 1000"
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # consola web: http://localhost:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"     # Swagger: http://localhost:8000/docs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # La API NO depende de RabbitMQ: con outbox, funciona aunque el broker esté caído.
+
+  relay:
+    <<: *app
+    command: ["python", "-m", "app.relay"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tests:
+    <<: *app
+    profiles: ["test"]
+    command: ["pytest", "-v"]
+    restart: "no"
+    environment:
+      <<: *app-env
+      # Base y colas propias: las pruebas no tocan los datos ni las colas de la demo
+      DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/demo_test
+      COLA_ASIGNACION: test.asignacion.viaje-solicitado
+      TIEMPO_PROCESAMIENTO: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
