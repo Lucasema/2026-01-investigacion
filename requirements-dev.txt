@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest==9.2.0
+# Cliente HTTP que usa el TestClient de Starlette (reemplaza a httpx en las pruebas)
+httpx2==2.16.0
