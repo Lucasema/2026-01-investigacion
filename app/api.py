@@ -1,100 +1,84 @@
-# API de Viajes (productor).
+# API de M2 (Clientes): el cliente califica al conductor después de un viaje.
 #
-# POST /viajes             -> CON outbox: guarda viaje + evento en una transacción y responde 202.
-# POST /viajes/sin-outbox  -> SIN outbox: guarda el viaje y publica directo en RabbitMQ
-#                             (la versión ingenua, para comparar en la demo).
-# GET  /viajes/{id}        -> estado actual del viaje (lo consulta el cliente después del 202).
-# GET  /outbox             -> eventos de la bandeja de salida (para observar la demo).
-# GET  /health             -> estado de la API y de la base.
-import json
-from uuid import UUID
+# POST /calificaciones             CON outbox: guarda la calificación y el evento juntos.
+# POST /calificaciones/sin-outbox  SIN outbox: guarda y publica directo (para comparar).
+#
+# El promedio del conductor lo calcula después el worker, que hace de M3 (Conductores).
+import uuid
 
 import pika
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-from app import config, mensajeria, viajes
+from app import config, mensajeria
 
 log = config.configurar_logs("api")
 
-app = FastAPI(title="Demo colas + Transactional Outbox", version="1.0.0")
+app = FastAPI(title="Demo: colas de mensajes + Transactional Outbox")
 
 
-class SolicitudViaje(BaseModel):
-    clienteId: str = Field(min_length=1, examples=["ana-gomez"])
-    origen: str = Field(min_length=1, examples=["Av. Sarmiento 1500"])
-    destino: str = Field(min_length=1, examples=["French 414"])
+class Calificacion(BaseModel):
+    viajeId: str = Field(min_length=1, examples=["viaje-123"])
+    conductorId: str = Field(min_length=1, examples=["carlos"])
+    puntaje: int = Field(ge=1, le=5, examples=[5])
 
 
-@app.post("/viajes", status_code=202)
-def solicitar_viaje(datos: SolicitudViaje):
-    """Versión CON Transactional Outbox. No toca RabbitMQ: funciona aunque el broker esté caído."""
-    try:
-        viaje_id, evento_id = viajes.solicitar_viaje_con_outbox(datos.clienteId, datos.origen, datos.destino)
-    except psycopg.OperationalError:
-        raise HTTPException(503, "La base de datos no está disponible.")
-    log.info("viaje=%s evento=%s guardados en una transacción (outbox PENDIENTE)", viaje_id, evento_id)
-    # 202 Accepted: recibido y registrado; la asignación del conductor se hace después
-    return JSONResponse(
-        {"viajeId": viaje_id, "estado": "SOLICITADO", "eventoId": evento_id},
-        status_code=202,
-        headers={"Location": f"/viajes/{viaje_id}"},
-    )
+def conectar_db():
+    return psycopg.connect(config.DATABASE_URL, connect_timeout=3)
 
 
-@app.post("/viajes/sin-outbox", status_code=202)
-def solicitar_viaje_sin_outbox(datos: SolicitudViaje):
-    """Versión SIN outbox (escritura dual). Sirve para mostrar el problema.
+def guardar_con_outbox(datos: Calificacion, evento_id: str | None = None) -> tuple[str, str]:
+    """Transactional Outbox: la calificación y el evento se guardan en UNA transacción.
 
-    1. Guarda el viaje (COMMIT).
-    2. Publica en RabbitMQ.
-    Si el paso 2 falla, el viaje ya quedó guardado y el mensaje se perdió para siempre.
+    psycopg abre la transacción con el primer comando. Al salir del bloque "with" hace
+    COMMIT; si algo falla, ROLLBACK de las dos filas. Esta función no toca RabbitMQ.
     """
-    viaje_id = viajes.guardar_viaje_sin_outbox(datos.clienteId, datos.origen, datos.destino)
-    try:
-        conexion, canal = mensajeria.conectar()
-        try:
-            canal.basic_publish(
-                exchange="",
-                routing_key=config.COLA_ASIGNACION,
-                body=json.dumps({"eventoId": viaje_id, "viajeId": viaje_id}),
-                properties=mensajeria.propiedades_persistentes(viaje_id),
-            )
-        finally:
-            conexion.close()
-    except pika.exceptions.AMQPError as error:
-        log.error("viaje=%s guardado pero el evento se PERDIÓ (RabbitMQ no disponible: %s)",
-                  viaje_id, error.__class__.__name__)
-        return JSONResponse(
-            {"viajeId": viaje_id, "estado": "SOLICITADO",
-             "error": "El viaje se guardó pero el evento no se pudo publicar: nadie lo va a procesar."},
-            status_code=500,
+    calificacion_id = str(uuid.uuid4())
+    evento_id = evento_id or str(uuid.uuid4())
+    evento = {"eventoId": evento_id, "conductorId": datos.conductorId, "puntaje": datos.puntaje}
+
+    with conectar_db() as conexion:
+        conexion.execute(
+            "INSERT INTO calificaciones (id, viaje_id, conductor_id, puntaje) VALUES (%s, %s, %s, %s)",
+            (calificacion_id, datos.viajeId, datos.conductorId, datos.puntaje),
         )
-    log.info("viaje=%s guardado y publicado directo (sin outbox)", viaje_id)
-    return JSONResponse({"viajeId": viaje_id, "estado": "SOLICITADO"}, status_code=202,
-                        headers={"Location": f"/viajes/{viaje_id}"})
+        conexion.execute(
+            "INSERT INTO outbox (id, tipo, payload) VALUES (%s, 'ConductorCalificado', %s)",
+            (evento_id, Jsonb(evento)),
+        )
+    return calificacion_id, evento_id
 
 
-@app.get("/viajes/{viaje_id}")
-def consultar_viaje(viaje_id: UUID):
-    viaje = viajes.obtener_viaje(str(viaje_id))
-    if viaje is None:
-        raise HTTPException(404, "El viaje no existe.")
-    return viaje
+@app.post("/calificaciones", status_code=202)
+def calificar(datos: Calificacion):
+    calificacion_id, evento_id = guardar_con_outbox(datos)
+    log.info("calificación %s guardada junto con el evento %s (PENDIENTE)", calificacion_id, evento_id)
+    # 202 Accepted: la calificación quedó registrada; el promedio se actualiza después
+    return JSONResponse({"calificacionId": calificacion_id, "eventoId": evento_id}, status_code=202)
 
 
-@app.get("/outbox")
-def consultar_outbox(estado: str | None = None, limite: int = 50):
-    return viajes.listar_outbox(estado, limite)
-
-
-@app.get("/health")
-def salud():
+@app.post("/calificaciones/sin-outbox", status_code=202)
+def calificar_sin_outbox(datos: Calificacion):
+    """Versión SIN outbox (escritura dual), solo para mostrar el problema."""
+    calificacion_id = str(uuid.uuid4())
+    # 1. Guarda la calificación: al salir del "with" ya se hizo COMMIT
+    with conectar_db() as conexion:
+        conexion.execute(
+            "INSERT INTO calificaciones (id, viaje_id, conductor_id, puntaje) VALUES (%s, %s, %s, %s)",
+            (calificacion_id, datos.viajeId, datos.conductorId, datos.puntaje),
+        )
+    # 2. Publica directo en RabbitMQ. Si falla, el evento se pierde: no quedó anotado en ningún lado
+    evento = {"eventoId": calificacion_id, "conductorId": datos.conductorId, "puntaje": datos.puntaje}
     try:
-        with viajes.conectar_db() as conexion:
-            conexion.execute("SELECT 1")
-        return {"estado": "ok", "base": "ok"}
-    except psycopg.OperationalError:
-        return JSONResponse({"estado": "degradado", "base": "no disponible"}, status_code=503)
+        conexion_rabbit, canal = mensajeria.conectar(confirmar_publicaciones=True)
+        mensajeria.publicar(canal, calificacion_id, evento)
+        conexion_rabbit.close()
+    except pika.exceptions.AMQPError:
+        log.error("calificación %s guardada, pero el evento se PERDIÓ: RabbitMQ no disponible", calificacion_id)
+        return JSONResponse({"calificacionId": calificacion_id,
+                             "error": "La calificación se guardó, pero el evento no se pudo publicar."},
+                            status_code=500)
+    return JSONResponse({"calificacionId": calificacion_id}, status_code=202)

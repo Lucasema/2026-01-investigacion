@@ -31,7 +31,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://demo:demo@localhost:5432/demo_test
       RABBITMQ_URL: amqp://demo:demo@localhost:5672/%2F
-      COLA_ASIGNACION: test.asignacion.viaje-solicitado
+      COLA: test-calificaciones
       TIEMPO_PROCESAMIENTO: "0"
     steps:
       - uses: actions/checkout@v4

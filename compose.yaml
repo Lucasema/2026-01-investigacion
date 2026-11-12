@@ -8,12 +8,10 @@
 
 x-app: &app
   build: .
-  image: demo-colas-outbox:1.0.0
+  image: demo-colas-outbox:2.0.0
   environment: &app-env
     DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/${POSTGRES_DB:-demo}
     RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-demo}:${RABBITMQ_DEFAULT_PASS:-demo}@rabbitmq:5672/%2F
-    RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-demo}
-    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-demo}
     TIEMPO_PROCESAMIENTO: ${TIEMPO_PROCESAMIENTO:-3}
     INTERVALO_RELAY: ${INTERVALO_RELAY:-1}
   restart: unless-stopped
@@ -90,7 +88,7 @@ services:
       <<: *app-env
       # Base y colas propias: las pruebas no tocan los datos ni las colas de la demo
       DATABASE_URL: postgresql://${POSTGRES_USER:-demo}:${POSTGRES_PASSWORD:-demo}@postgres:5432/demo_test
-      COLA_ASIGNACION: test.asignacion.viaje-solicitado
+      COLA: test-calificaciones
       TIEMPO_PROCESAMIENTO: "0"
     depends_on:
       postgres:

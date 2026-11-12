@@ -1,76 +1,55 @@
-# Relay del outbox (polling publisher).
-#
-# Cada INTERVALO_RELAY segundos lee los eventos PENDIENTE de la tabla outbox, los publica
-# en RabbitMQ con confirmación del broker y recién entonces los marca PUBLICADO.
+# Relay del outbox: cada segundo publica en RabbitMQ los eventos PENDIENTE y los marca PUBLICADO.
 # Si RabbitMQ está caído, los eventos quedan PENDIENTE y se reintentan en la vuelta siguiente.
-import json
 import time
 
 import pika
 import psycopg
 
-from app import config, mensajeria, viajes
+from app import config, mensajeria
+from app.api import conectar_db
 
 log = config.configurar_logs("relay")
 
 
-def publicar_pendientes(canal, limite: int = 100) -> int:
-    """Publica los eventos pendientes en orden de creación. Devuelve cuántos publicó.
-
-    Si RabbitMQ falla a mitad de camino, lanza la excepción: los eventos ya publicados
-    quedaron marcados y el resto sigue PENDIENTE.
-    """
+def publicar_pendientes(canal) -> int:
+    """Publica los eventos PENDIENTE en orden de creación y devuelve cuántos publicó."""
     publicados = 0
-    with viajes.conectar_db() as conexion:
+    with conectar_db() as conexion:
         pendientes = conexion.execute(
-            "SELECT id, tipo, payload FROM outbox WHERE estado = 'PENDIENTE' "
-            "ORDER BY creado_en LIMIT %s",
-            (limite,),
+            "SELECT id, payload FROM outbox WHERE estado = 'PENDIENTE' ORDER BY creado_en"
         ).fetchall()
-        for evento_id, tipo, payload in pendientes:
-            evento_id = str(evento_id)
-            # Con confirm_delivery activado, basic_publish espera la confirmación del broker
-            # y lanza una excepción de pika si no la recibe.
-            canal.basic_publish(
-                exchange="",
-                routing_key=config.COLA_ASIGNACION,
-                body=json.dumps({"eventoId": evento_id, "tipo": tipo, **payload}),
-                properties=mensajeria.propiedades_persistentes(evento_id),
-                mandatory=True,
-            )
-            # Si el proceso se cae justo acá (publicado pero no marcado), al reiniciar
-            # lo publica otra vez: entrega "al menos una vez". El worker es idempotente.
+        for evento_id, evento in pendientes:
+            # Con confirm_delivery, esta línea espera la confirmación de RabbitMQ.
+            # Si no llega, lanza una excepción y el evento NO se marca.
+            mensajeria.publicar(canal, str(evento_id), evento)
+            # Si el relay se cae justo acá (publicado pero no marcado), al volver lo
+            # publica otra vez: entrega "al menos una vez". Por eso el worker es idempotente.
             conexion.execute(
                 "UPDATE outbox SET estado = 'PUBLICADO', publicado_en = now() WHERE id = %s",
                 (evento_id,),
             )
             conexion.commit()
             publicados += 1
-            log.info("evento=%s viaje=%s publicado", evento_id, payload.get("viajeId"))
+            log.info("evento %s publicado", evento_id)
     return publicados
 
 
 def main() -> None:
     log.info("Relay iniciado: revisa el outbox cada %s s", config.INTERVALO_RELAY)
-    conexion_rabbit = canal = None
+    canal = None
     while True:
         try:
             if canal is None or canal.is_closed:
-                conexion_rabbit, canal = mensajeria.conectar(confirmar_publicaciones=True)
+                _, canal = mensajeria.conectar(confirmar_publicaciones=True)
                 log.info("Conectado a RabbitMQ")
             publicar_pendientes(canal)
-        except pika.exceptions.AMQPError as error:
-            # Incluye conexión rechazada, conexión perdida y publicación no confirmada.
-            # (El ConnectionError estándar de Python NO atrapa los errores de pika.)
-            log.warning("RabbitMQ no disponible, los eventos siguen PENDIENTE: %s", error.__class__.__name__)
-            if conexion_rabbit is not None and conexion_rabbit.is_open:
-                try:
-                    conexion_rabbit.close()
-                except pika.exceptions.AMQPError:
-                    pass
-            conexion_rabbit = canal = None
-        except psycopg.OperationalError as error:
-            log.warning("Base de datos no disponible, se reintenta: %s", error)
+        except pika.exceptions.AMQPError:
+            # Cualquier error de RabbitMQ (caído, conexión perdida, publicación no confirmada).
+            # Ojo: el ConnectionError estándar de Python NO atrapa los errores de pika.
+            log.warning("RabbitMQ no disponible: los eventos siguen PENDIENTE")
+            canal = None  # en la próxima vuelta se reconecta
+        except psycopg.OperationalError:
+            log.warning("Base de datos no disponible, se reintenta")
         time.sleep(config.INTERVALO_RELAY)
 
 

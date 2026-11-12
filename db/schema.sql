@@ -1,36 +1,38 @@
--- Esquema de la demo. Lo ejecuta PostgreSQL al crear la base (docker-entrypoint-initdb.d)
--- y también las pruebas, sobre su propia base. Por eso usa IF NOT EXISTS.
+-- Tablas de la demo. PostgreSQL las crea al iniciar (docker-entrypoint-initdb.d);
+-- las pruebas también las crean en su propia base, por eso usan IF NOT EXISTS.
 
--- Datos de negocio: los viajes.
-CREATE TABLE IF NOT EXISTS viajes (
-    id                  UUID PRIMARY KEY,
-    cliente_id          TEXT NOT NULL,
-    origen              TEXT NOT NULL,
-    destino             TEXT NOT NULL,
-    estado              TEXT NOT NULL DEFAULT 'SOLICITADO',
-    conductor           TEXT,
-    -- Cuántas veces el worker aplicó la asignación. Con un consumidor idempotente
-    -- tiene que valer 1 aunque el mismo evento llegue varias veces.
-    asignaciones        INT NOT NULL DEFAULT 0,
-    creado_en           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    actualizado_en      TIMESTAMPTZ NOT NULL DEFAULT now()
+-- ===== Lado de M2 (Clientes): la calificación y su bandeja de salida =====
+
+-- Calificaciones que los clientes le ponen al conductor después de un viaje (RF-2.5).
+CREATE TABLE IF NOT EXISTS calificaciones (
+    id              UUID PRIMARY KEY,
+    viaje_id        TEXT NOT NULL,
+    conductor_id    TEXT NOT NULL,
+    puntaje         INT NOT NULL CHECK (puntaje BETWEEN 1 AND 5),
+    creado_en       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Bandeja de salida (Transactional Outbox): eventos que el relay tiene que publicar.
--- Se escribe en la MISMA transacción que la tabla viajes.
+-- Transactional Outbox: eventos que el relay tiene que publicar en RabbitMQ.
+-- Se escribe en la MISMA transacción que la tabla calificaciones.
 CREATE TABLE IF NOT EXISTS outbox (
-    id              UUID PRIMARY KEY,               -- eventoId: el consumidor deduplica con este valor
-    tipo            TEXT NOT NULL,                  -- por ejemplo, ViajeSolicitado
+    id              UUID PRIMARY KEY,               -- eventoId: con este valor el worker detecta duplicados
+    tipo            TEXT NOT NULL,                  -- ConductorCalificado
     payload         JSONB NOT NULL,
-    estado          TEXT NOT NULL DEFAULT 'PENDIENTE' CHECK (estado IN ('PENDIENTE', 'PUBLICADO')),
+    estado          TEXT NOT NULL DEFAULT 'PENDIENTE',  -- PENDIENTE o PUBLICADO
     creado_en       TIMESTAMPTZ NOT NULL DEFAULT now(),
     publicado_en    TIMESTAMPTZ
 );
 
--- Índice parcial: el relay solo recorre los pendientes aunque haya miles de publicados.
-CREATE INDEX IF NOT EXISTS outbox_pendientes ON outbox (creado_en) WHERE estado = 'PENDIENTE';
+-- ===== Lado de M3 (Conductores): en la realidad sería otra base de datos =====
 
--- Eventos que el worker ya procesó (consumidor idempotente).
+-- Promedio de cada conductor: suma de puntajes y cantidad de calificaciones contadas.
+CREATE TABLE IF NOT EXISTS promedios_conductor (
+    conductor_id    TEXT PRIMARY KEY,
+    cantidad        INT NOT NULL,
+    suma            INT NOT NULL
+);
+
+-- Eventos que el worker ya procesó: así un evento repetido no se cuenta dos veces.
 CREATE TABLE IF NOT EXISTS eventos_procesados (
     evento_id       UUID PRIMARY KEY,
     procesado_en    TIMESTAMPTZ NOT NULL DEFAULT now()
