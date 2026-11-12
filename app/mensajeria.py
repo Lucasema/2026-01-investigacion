@@ -15,7 +15,12 @@ def conectar(confirmar_publicaciones: bool = False):
     parametros = pika.URLParameters(config.RABBITMQ_URL)
     parametros.connection_attempts = 1
     parametros.socket_timeout = 3
-    conexion = pika.BlockingConnection(parametros)
+    try:
+        conexion = pika.BlockingConnection(parametros)
+    except OSError as error:
+        # Con RabbitMQ apagado, Docker borra el nombre "rabbitmq" de la red y el error es de
+        # Python ("ese nombre no existe"), no de pika. Se convierte para manejarlo igual que el resto.
+        raise pika.exceptions.AMQPConnectionError(error) from error
     canal = conexion.channel()
     if confirmar_publicaciones:
         canal.confirm_delivery()

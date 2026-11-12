@@ -56,7 +56,8 @@ def test_con_rabbitmq_caido_el_evento_queda_pendiente_y_sale_al_volver(canal):
 
 
 def test_sin_outbox_el_evento_se_pierde_con_rabbitmq_caido(canal, monkeypatch):
-    monkeypatch.setattr(config, "RABBITMQ_URL", "amqp://demo:demo@localhost:1/%2F")  # nadie escucha ahí
+    # Como en Docker con RabbitMQ apagado: el nombre del servidor no existe
+    monkeypatch.setattr(config, "RABBITMQ_URL", "amqp://demo:demo@rabbitmq-apagado.invalid:5672/%2F")
 
     respuesta = cliente.post("/calificaciones/sin-outbox", json=CALIFICACION)
 
