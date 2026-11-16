@@ -1,167 +1,147 @@
-# Demo: colas de mensajes + Transactional Outbox
+# Módulo M2 (Clientes) - Calificación de Conductores con Transactional Outbox y Colas Asíncronas
 
-**Desarrollo de Software 2026 · UTN FRRe · Grupo 1**
-Trabajo de investigación, Par 04: **Tema 2** (Colas de mensajes y procesamiento asíncrono) y **Tema 27** (Patrón Transactional Outbox).
+**Desarrollo de Software · UTN FRRe**  
+Trabajo Práctico Integrador (TPI) · Plataforma de Movilidad Urbana.  
+**Tema:** Colas de mensajes y procesamiento asíncrono (Tema 2) y Patrón Transactional Outbox (Tema 27).
 
-> **Documento de investigación:** [`documento-investigacion.pdf`](documento-investigacion.pdf).
->
-> **Base de datos:** el TPI usa MongoDB, pero esta demo es un proyecto aparte y usa **PostgreSQL**, donde la transacción del outbox se ve de forma directa (dos `INSERT` y un `COMMIT`).
+---
 
-## Qué demuestra
+## 1. Investigación Conceptual
 
-Un cliente califica al conductor después de un viaje. **M2 (Clientes)** guarda la calificación y responde al instante. **M3 (Conductores)** suma esa calificación al promedio del conductor después, cuando le llega el aviso por una cola.
+### 1.1. Colas de Mensajes y Procesamiento Asíncrono
 
-```mermaid
-flowchart LR
-    C["Cliente"] -->|"POST /calificaciones"| API["API de M2"]
-    API -->|"202"| C
-    API -->|"calificación + evento<br/>en UNA transacción"| DB[("PostgreSQL<br/>calificaciones + outbox")]
-    R["Relay"] -->|"lee PENDIENTE"| DB
-    R -->|"publica"| Q[["RabbitMQ<br/>cola"]]
-    Q -->|"entrega"| W["Worker (M3)"]
-    W -->|"suma al promedio<br/>(una sola vez) + ack"| DB
-```
+**Definición y Problema que Resuelve**  
+En una arquitectura web tradicional basada en comunicación síncrona, cuando un cliente envía una solicitud HTTP a una API, la conexión de red permanece abierta y bloqueada hasta que el servidor ejecuta toda la lógica de negocio y devuelve la respuesta. Si la operación incluye tareas pesadas o que involucran a otros módulos (como recálculo de reputación, auditoría o notificaciones), la demora se traslada directamente al usuario. Este acoplamiento síncrono provoca agotamiento de hilos, saturación de memoria y errores de tiempo de espera agotado (Gateway Timeout).
 
-| Archivo | Tema | Qué hace |
-|---|---|---|
-| `app/api.py` | Outbox | Guarda la calificación y el evento `ConductorCalificado` en la misma transacción. No se conecta a RabbitMQ. También tiene la versión **sin outbox**, para comparar. |
-| `app/relay.py` | Outbox | Cada 1 s publica los eventos `PENDIENTE` y los marca `PUBLICADO`. Si RabbitMQ está caído, reintenta. |
-| `app/worker.py` | Colas | Consume de a un mensaje, con ack manual. Es idempotente: un evento repetido no se suma dos veces al promedio. |
-| `app/mensajeria.py` | Colas | Conexión con RabbitMQ: cola durable, mensajes persistentes y confirmación de publicación. |
+El uso de colas de mensajes y procesamiento asíncrono resuelve este cuello de botella intercalando un gestor de mensajería (**Message Broker**, como RabbitMQ) entre el servidor web (**Productor**) y el programa encargado de ejecutar la tarea pesada (**Consumidor** o **Worker**). Una cola es una estructura temporal de tipo FIFO (First In, First Out) donde cada tarea viaja encapsulada como un paquete de texto estructurado en formato JSON.
 
-## Cómo levantarlo
+**Desacoplamiento HTTP y Comportamiento ante Fallas del Consumidor**  
+El flujo técnico opera en dos fases independientes:
+* **Fase 1: Respuesta HTTP inmediata (Código 202 Accepted):** Cuando la API recibe la petición, valida la estructura de los datos de entrada y registra la tarea sin ejecutar el procesamiento pesado. El mensaje ingresa a la cola del broker y la API responde en milisegundos con el código HTTP **202 Accepted**.
+* **Fase 2: Retención y recuperación ante caída del Worker:** El broker almacena cada mensaje en disco duro y gestiona su ciclo de vida mediante confirmaciones manuales (`ACK` / `NACK`). Si el contenedor del worker se apaga o falla a mitad de una tarea antes de emitir el `ACK`, el broker detecta la desconexión TCP, saca el mensaje del estado `Unacked` y lo devuelve automáticamente al estado `Ready` al principio de la fila para que no se pierda.
 
-Requisito: **Docker Desktop** abierto. Python, PostgreSQL y RabbitMQ corren en contenedores.
+**Características Principales**
+* **Desacoplamiento temporal:** El productor y el consumidor no necesitan estar encendidos en el mismo instante.
+* **Durabilidad y persistencia:** Tanto la cola (`durable=True`) como los mensajes (`delivery_mode=2`) se graban en disco duro.
+* **Control de flujo (Prefetch):** Mediante `prefetch_count=1`, el broker entrega un único mensaje a la vez a cada worker, protegiendo su memoria RAM.
+
+---
+
+### 1.2. Patrón Transactional Outbox
+
+**Definición y Problema que Resuelve**  
+En los sistemas distribuidos, un servicio suele necesitar realizar dos acciones conjuntas: modificar el estado en su **Base de Datos** e informar ese suceso publicando un evento en el **Broker de Mensajes**. Dado que la base de datos (PostgreSQL) y el broker (RabbitMQ) son servidores independientes, no comparten una transacción atómica única.
+
+Intentar ejecutar ambas escrituras de forma secuencial dentro del mismo endpoint genera el **Problema de la Doble Escritura (Dual-Write Problem)**:
+1. Si se hace `COMMIT` en la base de datos y falla la publicación en RabbitMQ, el registro queda guardado pero el evento se pierde permanentemente.
+2. Si se publica primero en el broker y falla la base de datos (`ROLLBACK`), el worker procesará un evento fantasma sobre un dato que no existe.
+
+**Garantía de Consistencia mediante Transacción Local y Proceso Posterior**  
+El patrón **Transactional Outbox** soluciona esto dividiendo la operación en dos mecanismos:
+* **Mecanismo 1: Escritura atómica en tabla Outbox local:** En el mismo motor de base de datos se crea una tabla adicional llamada `outbox_eventos`. La API abre una única transacción local (`BEGIN`), inserta el registro principal y el evento JSON con estado `PENDIENTE` en la tabla outbox, ejecutando un único `COMMIT` atómico.
+* **Mecanismo 2: Retransmisión asíncrona (Message Relay):** Un proceso independiente en segundo plano consulta periódicamente la tabla `outbox_eventos` (`SELECT ... WHERE estado = 'PENDIENTE'`) y publica los mensajes en RabbitMQ. Solo cuando el broker confirma la recepción, el proceso actualiza la fila a estado `PUBLICADO`.
+
+**Idempotencia en el Consumidor**  
+El patrón garantiza semántica de entrega **al menos una vez (At-least-once)**: ante una falla del relay justo antes de marcar como `PUBLICADO`, el evento puede enviarse duplicado. Por ello, es obligatorio que el worker consumidor sea **idempotente**, verificando en la base de datos si el identificador ya fue procesado antes de volver a ejecutar la lógica de negocio.
+
+---
+
+## 2. Relación con el Trabajo Práctico Integrador (Plataforma de Movilidad Urbana)
+
+En el marco del Trabajo Práctico Integrador, este repositorio implementa el **Módulo M2: Clientes**, abarcando específicamente el requerimiento **RF-2.5 (Calificación del conductor)**:
+* *"El cliente deberá poder registrar una valoración posterior a un viaje completado, evitando duplicados para el mismo viaje"*.
+
+### 2.1. Escenario en la Plataforma
+Cuando un cliente califica a un conductor desde su aplicación móvil tras finalizar un viaje, M2 registra la valoración y debe notificar asíncronamente al **Módulo M3 (Conductores y Vehículos)** para actualizar su reputación histórica y evaluar su habilitación (`RF-3.1`, `RF-3.4`), y a **M8 (Notificaciones y Soporte)** para auditar la reseña (`RF-8.8`).
+
+Aplicar **Transactional Outbox** y **Colas Asíncronas** garantiza que:
+1. La aplicación del cliente responda de inmediato (`202 Accepted`) sin demoras.
+2. Si RabbitMQ sufre una caída en hora pico, la calificación del cliente no se pierda y quede resguardada de forma segura en la tabla outbox de PostgreSQL.
+3. Si un mensaje se reenvía por duplicado, el consumidor (Worker de M3) lo detecte mediante control de idempotencia y evite sumar dos veces la misma puntuación al conductor.
+
+---
+
+## 3. Arquitectura de la Solución (Contenedores Docker)
+
+El sistema se compone de 4 servicios integrados mediante Docker Compose:
+1. **`db` (PostgreSQL 16):** Almacena la tabla de negocio `calificaciones` y la bandeja de salida `outbox_eventos`.
+2. **`broker` (RabbitMQ 3):** Gestiona la cola durable `cola_calificaciones_m2`.
+3. **`api` (FastAPI / M2):** Expone los endpoints HTTP en el puerto `8000`.
+4. **`relay` y `worker`:** Procesos en segundo plano encargados de la retransmisión outbox y del consumo idempotente con confirmación manual (`ACK`).
+
+---
+
+## 4. Guía de Ejecución y Demostración Práctica
+
+Asegúrate de tener **Docker Desktop** abierto y ejecutándose en tu PC. Abre tu terminal (PowerShell o CMD) en la carpeta raíz del proyecto y ejecuta:
 
 ```powershell
-cd C:\Proyectos\2026-01-investigacion
 docker compose up -d --build
 ```
 
-- Consola de RabbitMQ: http://localhost:15672 (usuario `demo`, contraseña `demo`), pestaña *Queues*.
-- Logs: `docker compose logs -f relay worker`.
-- Si la API de M2 del TPI ya usa el puerto 8000, copiá `.env.example` como `.env` y poné `API_PORT=8001`.
+- **Panel interactivo Swagger UI (API):** [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Consola web de RabbitMQ:** [http://localhost:15672](http://localhost:15672) *(Usuario: `guest`, Clave: `guest`)*
+- **Ver logs en tiempo real (con correlación de IDs y pasos):**
+  ```powershell
+  docker compose logs -f api relay worker
+  ```
 
-Atajo para PowerShell (vale para la sesión abierta):
+---
 
-```powershell
-function demo { docker compose exec api python -m scripts.demo @args }
-```
+## 5. Guion de Demostración para el Coloquio (5 Actos)
 
-| Comando | Qué hace |
-|---|---|
-| `demo calificar 5` | El cliente califica 5 veces al conductor "carlos" |
-| `demo calificar 1 --sin-outbox` | Califica con la versión sin outbox |
-| `demo resumen` | Calificaciones guardadas (M2), estado del outbox, calificaciones contadas en el promedio (M3) y mensajes en la cola |
-| `demo duplicar` | Hace que el relay publique otra vez el último evento |
+### Acto 1: Flujo Normal y Desacoplamiento HTTP
+1. En Swagger ([http://localhost:8000/docs](http://localhost:8000/docs)), despliega el **Botón 1 (`POST /calificaciones`)** y haz clic en *Execute*.
+2. Observa que responde de forma instantánea con código **`202 Accepted`**.
+3. En la terminal de logs verás la trazabilidad detallada paso a paso (`[CALIFICACIÓN #ID | PASO X]`), mostrando la transacción atómica en la BD de M2, la publicación del Relay y el consumo del Worker.
 
-La regla para leer el resumen: **"guardadas" (M2) y "contadas" (M3) tienen que terminar siendo iguales**. Si guardadas es mayor, se perdió un evento; si contadas es mayor, se contó un duplicado.
+### Acto 2: Caída del Consumidor (Worker) y Fila en Espera
+1. Detén el contenedor del worker:
+   ```powershell
+   docker compose stop worker
+   ```
+2. Ejecuta varias veces el **Botón 1** en Swagger. La API seguirá respondiendo `202 Accepted`.
+3. Entra a la consola web de RabbitMQ y verás los mensajes acumulados en estado **`Ready`**.
+4. Vuelve a encender el worker:
+   ```powershell
+   docker compose start worker
+   ```
+   Los mensajes pasarán a `Unacked` y se procesarán secuencialmente de a uno gracias al control de flujo (`prefetch_count=1`).
 
-## Escenarios de la demostración
+### Acto 3: Mecanismo ACK y Recuperación ante Caída del Worker
+1. Con el sistema procesando un mensaje, mata de golpe al worker a mitad de la operación:
+   ```powershell
+   docker compose kill worker
+   ```
+2. Observa en la consola de RabbitMQ que el mensaje que estaba en `Unacked` regresa automáticamente al estado **`Ready`** al cortarse la conexión TCP sin recibir el `ACK`.
+3. Vuelve a iniciar el worker (`docker compose start worker`) y verás en los logs el aviso de que el mensaje fue `[REENTREGADO]`.
 
-### 1. Flujo normal
+### Acto 4: Caída del Broker y Patrón Transactional Outbox
+1. Apaga RabbitMQ:
+   ```powershell
+   docker compose stop broker
+   ```
+2. Prueba el **Botón 2 (`POST /calificaciones/sin-outbox`)**: devolverá un **Error 500** porque se guardó en la BD pero el evento se perdió al estar caído el broker (*problema de doble escritura / dual-write*).
+3. Prueba el **Botón 1 (`POST /calificaciones` CON Outbox)**: devolverá **`202 Accepted`** con total normalidad, ya que el evento queda resguardado de forma segura en la tabla `outbox_eventos` con estado `PENDIENTE`.
+4. Enciende nuevamente RabbitMQ (`docker compose start broker`): el proceso Relay detectará la reconexión en el siguiente ciclo y publicará los eventos pendientes automáticamente.
 
-```powershell
-demo calificar 1
-demo resumen
-```
+### Acto 5: Idempotencia del Consumidor (RF-2.5 y RNF-09)
+1. Toma el ID de una calificación completada (por ejemplo, `1`) y ejecuta el **Botón 3 (`POST /calificaciones/{id}/forzar-duplicado`)**.
+2. Esto obliga al Relay a reenviar el evento a RabbitMQ.
+3. En los logs verás cómo el Worker detecta mediante la base de datos que la calificación ya estaba procesada y muestra el aviso de **`IDEMPOTENCIA`**, descartando el duplicado para no sumar dos veces la puntuación al conductor.
 
-Responde `202` en milisegundos. Unos 3 segundos después, la calificación está contada en el promedio.
+---
 
-### 2. El worker está detenido (colas)
-
-```powershell
-docker compose stop worker
-demo calificar 4
-demo resumen                  # la cola tiene 4 mensajes esperando
-docker compose start worker
-demo resumen                  # (después de unos segundos) contadas = guardadas
-```
-
-La API sigue respondiendo `202`. Los mensajes esperan en la cola y el worker los procesa cuando vuelve.
-
-### 3. El worker se cae a mitad de un mensaje (colas)
-
-```powershell
-demo calificar 1
-docker compose kill worker      # dentro de los 3 segundos
-demo resumen                     # el mensaje volvió a la cola
-docker compose start worker
-```
-
-El worker no llegó a mandar el ack, así que RabbitMQ devolvió el mensaje a la cola. El log dice `recibido (reentregado)`.
-
-### 4. RabbitMQ está caído (outbox)
-
-```powershell
-docker compose stop rabbitmq
-demo calificar 3
-demo resumen                  # outbox: PENDIENTE 3
-docker compose start rabbitmq
-demo resumen                  # (después de unos segundos) todo PUBLICADO y contado
-```
-
-La API sigue respondiendo `202` porque no habla con RabbitMQ. Los eventos esperan en la tabla `outbox` y el relay los publica cuando RabbitMQ vuelve.
-
-### 5. La misma falla sin outbox
-
-```powershell
-docker compose stop rabbitmq
-demo calificar 1 --sin-outbox
-docker compose start rabbitmq
-demo resumen
-```
-
-Responde `500`: la calificación se guardó, pero el evento se perdió. El resumen queda con **una guardada más que las contadas**, para siempre.
-
-### 6. Evento duplicado (consumidor idempotente)
-
-```powershell
-demo duplicar
-demo resumen
-```
-
-Simula que el relay publicó un evento y se cayó antes de marcarlo: lo publica otra vez. El worker muestra `DUPLICADO` y las contadas no cambian. Sin idempotencia, la misma calificación se sumaría dos veces y el promedio quedaría mal.
-
-### Empezar de cero
-
+## 6. Limpieza del Entorno
+Para apagar los contenedores y borrar por completo los volúmenes de la base de datos y la cola:
 ```powershell
 docker compose down -v
 ```
 
-## Pruebas
+---
 
-```powershell
-docker compose --profile test run --rm tests
-```
-
-Usan PostgreSQL y RabbitMQ reales, con su propia base y su propia cola. También corren en GitHub Actions en cada push.
-
-| Prueba | Qué verifica |
-|---|---|
-| `test_guarda_la_calificacion_y_el_evento_juntos` | La API responde 202 y guarda calificación y evento |
-| `test_si_falla_el_evento_tampoco_queda_la_calificacion` | Atomicidad: si falla el segundo INSERT, se deshace el primero |
-| `test_el_relay_publica_y_marca_los_pendientes` | El relay publica y marca `PUBLICADO` |
-| `test_con_rabbitmq_caido_el_evento_queda_pendiente_y_sale_al_volver` | Con RabbitMQ caído el evento espera; al volver se publica |
-| `test_sin_outbox_el_evento_se_pierde_con_rabbitmq_caido` | La versión sin outbox pierde el evento |
-| `test_flujo_completo_suma_la_calificacion_al_promedio` | API → relay → worker actualiza el promedio |
-| `test_un_evento_duplicado_se_cuenta_una_sola_vez` | Un evento publicado dos veces se cuenta una vez |
-| `test_dos_workers_con_el_mismo_evento_a_la_vez` | Sin condición de carrera entre dos workers |
-| `test_un_mensaje_sin_ack_vuelve_a_la_cola` | Un mensaje sin ack vuelve a la cola, marcado como reentregado |
-
-## Estructura
-
-```
-documento-investigacion.pdf   Documento de investigación
-app/api.py                    API de M2: calificación + outbox (y la versión sin outbox)
-app/relay.py                  Relay del outbox
-app/worker.py                 Worker de M3, idempotente
-app/mensajeria.py             Conexión con RabbitMQ
-app/config.py                 Configuración por variables de entorno
-db/schema.sql                 Tablas: calificaciones, outbox, promedios_conductor, eventos_procesados
-scripts/demo.py               Comandos de la demo
-tests/                        Pruebas
-compose.yaml                  PostgreSQL, RabbitMQ, API, relay, worker y pruebas
-```
-
-Para simplificar, las tablas de M2 y de M3 están en la misma base. En la plataforma real, cada módulo tendría la suya (RNF-05) y solo se comunicarían por la cola.
+## 7. Referencias Bibliográficas y Documentación Técnica
+* **Microservices.io (Chris Richardson):** Pattern *Transactional Outbox* y *Polling Publisher* (`https://microservices.io/patterns/data/transactional-outbox.html`).
+* **AWS Prescriptive Guidance:** *Transactional Outbox Pattern* en arquitecturas distribuidas de la nube.
+* **Microsoft Learn (Azure Architecture Center):** Patrones *Asynchronous Request-Reply* y *Queue-Based Load Leveling*.
+* **RabbitMQ Official Documentation:** *Work Queues*, persistencia durable, confirmaciones manuales y control de flujo (`basic_qos`).

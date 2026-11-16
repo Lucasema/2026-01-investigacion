@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: usuario_tp
+      POSTGRES_PASSWORD: clave_tp
+      POSTGRES_DB: bd_pedidos
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U usuario_tp -d bd_pedidos"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  broker:
+    image: rabbitmq:3-management-alpine
+    hostname: broker
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  api:
+    build: .
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  relay:
+    build: .
+    command: python -u relay.py
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_started
+
+  worker:
+    build: .
+    command: python -u worker.py
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_started
